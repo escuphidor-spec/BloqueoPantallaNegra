@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
@@ -12,6 +13,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.FrameLayout
@@ -22,13 +24,14 @@ class BlackScreenService : AccessibilityService() {
 
     private var windowManager: WindowManager? = null
     private var blackOverlay: View? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
     private var isOverlayShown = false
     private var currentForegroundPackage: String = ""
 
     // Guarda la app desbloqueada por emergencia hasta que el usuario salga de ella
     private var bypassedPackage: String? = null
 
-    // Nueva combinacion secreta: Abajo, Abajo, Arriba, Arriba
+    // Combinacion secreta: Abajo, Abajo, Arriba, Arriba
     private val secretCombo = listOf(
         KeyEvent.KEYCODE_VOLUME_DOWN,
         KeyEvent.KEYCODE_VOLUME_DOWN,
@@ -53,11 +56,24 @@ class BlackScreenService : AccessibilityService() {
         handler.post(scheduleCheckRunnable)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Si rota la pantalla mientras esta bloqueada, recalcular la altura para no tapar botones
+        if (isOverlayShown && blackOverlay != null && overlayParams != null) {
+            overlayParams?.height = getOverlayHeight()
+            try {
+                windowManager?.updateViewLayout(blackOverlay, overlayParams)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkgName = event.packageName?.toString() ?: return
 
-        // Si la pantalla negra esta activa y el usuario intenta bajar la barra de estado, cerrarla al instante
+        // Si intenta bajar la barra de estado mientras la pantalla negra esta activa, cerrarla
         if (pkgName == "com.android.systemui") {
             if (isOverlayShown) {
                 collapseStatusBar()
@@ -65,10 +81,10 @@ class BlackScreenService : AccessibilityService() {
             return
         }
 
-        // Ignorar paneles del sistema, teclados y subprocesos de la barra de notificaciones
+        // Ignorar paneles del sistema y teclados
         if (isIgnoredSystemPackage(pkgName)) return
 
-        // Si el usuario sale al Launcher (Inicio / Recientes), desbloquear de inmediato
+        // Si el usuario presiona Home o Recientes para salir al Launcher, quitar pantalla negra
         if (isLauncherPackage(pkgName)) {
             bypassedPackage = null
             currentForegroundPackage = pkgName
@@ -76,11 +92,8 @@ class BlackScreenService : AccessibilityService() {
             return
         }
 
-        // Ignorar paquetes que no sean aplicaciones instaladas abribles
         if (!isLaunchableApp(pkgName)) return
 
-        // Si la pantalla negra ya esta activa y entra un evento de otra app que no es el Launcher,
-        // verificar con rootInActiveWindow que no sea un widget dentro de la barra de estado
         if (isOverlayShown && pkgName != currentForegroundPackage) {
             handler.postDelayed({
                 verifyActiveWindowAndEvaluate()
@@ -113,7 +126,6 @@ class BlackScreenService : AccessibilityService() {
         val keyCode = event.keyCode
         val isVolumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
 
-        // Si la pantalla negra NO esta activa, los botones de volumen funcionan normal
         if (!isOverlayShown || !isVolumeKey) {
             return false
         }
@@ -222,14 +234,46 @@ class BlackScreenService : AccessibilityService() {
                 pkg == "android" ||
                 pkg == "com.android.systemui" ||
                 p.contains("systemui") ||
-                p.contains("quickboard") ||       // Panel de medios/dispositivos en barra de estado Samsung
-                p.contains("cocktailbar") ||      // Panel Edge de Samsung
-                p.contains("oneconnect") ||       // Control de dispositivos en barra de notificaciones
+                p.contains("quickboard") ||
+                p.contains("cocktailbar") ||
+                p.contains("oneconnect") ||
                 p.contains("permissioncontroller") ||
                 p.contains("inputmethod") ||
                 p.contains("honeyboard") ||
                 p.contains("keyboard") ||
                 p.contains("biometrics")
+    }
+
+    /**
+     * Calcula la altura completa de la pantalla menos la barra de navegacion inferior
+     * para cubrir desde la barra de estado superior (y = 0) sin tapar los botones virtuales.
+     */
+    private fun getOverlayHeight(): Int {
+        val dm = resources.displayMetrics
+        @Suppress("DEPRECATION")
+        windowManager?.defaultDisplay?.getRealMetrics(dm)
+        val fullHeight = dm.heightPixels
+
+        val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        val resNavHeight = if (resId > 0) {
+            resources.getDimensionPixelSize(resId)
+        } else {
+            (48 * dm.density).toInt()
+        }
+
+        var insetNavHeight = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = windowManager?.currentWindowMetrics
+            val insets = metrics?.windowInsets?.getInsetsIgnoringVisibility(
+                WindowInsets.Type.navigationBars()
+            )
+            if (insets != null) {
+                insetNavHeight = insets.bottom
+            }
+        }
+
+        val navBarHeight = maxOf(resNavHeight, insetNavHeight)
+        return fullHeight - navBarHeight
     }
 
     private fun showBlackScreen() {
@@ -247,7 +291,7 @@ class BlackScreenService : AccessibilityService() {
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            getOverlayHeight(),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -255,7 +299,8 @@ class BlackScreenService : AccessibilityService() {
             PixelFormat.OPAQUE
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            // Extiende la pantalla negra hasta la franja superior de la camara/barra de estado
+            x = 0
+            y = 0
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -265,6 +310,7 @@ class BlackScreenService : AccessibilityService() {
         try {
             windowManager?.addView(overlay, params)
             blackOverlay = overlay
+            overlayParams = params
             isOverlayShown = true
             currentKeyInputs.clear()
             collapseStatusBar()
@@ -281,6 +327,7 @@ class BlackScreenService : AccessibilityService() {
             e.printStackTrace()
         } finally {
             blackOverlay = null
+            overlayParams = null
             isOverlayShown = false
             currentKeyInputs.clear()
         }
