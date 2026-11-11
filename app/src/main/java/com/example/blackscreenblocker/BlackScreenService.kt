@@ -7,10 +7,12 @@ import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.FrameLayout
+import android.widget.Toast
 import java.util.Calendar
 
 class BlackScreenService : AccessibilityService() {
@@ -19,6 +21,19 @@ class BlackScreenService : AccessibilityService() {
     private var blackOverlay: View? = null
     private var isOverlayShown = false
     private var currentForegroundPackage: String = ""
+
+    // Guarda la app desbloqueada por emergencia hasta que el usuario salga de ella
+    private var bypassedPackage: String? = null
+
+    // Combinacion secreta: Subir, Subir, Bajar, Bajar
+    private val secretCombo = listOf(
+        KeyEvent.KEYCODE_VOLUME_UP,
+        KeyEvent.KEYCODE_VOLUME_UP,
+        KeyEvent.KEYCODE_VOLUME_DOWN,
+        KeyEvent.KEYCODE_VOLUME_DOWN
+    )
+    private val currentKeyInputs = mutableListOf<Int>()
+    private var lastKeyEventTime = 0L
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -41,12 +56,61 @@ class BlackScreenService : AccessibilityService() {
 
         if (isIgnoredSystemPackage(pkgName)) return
 
+        // Si el usuario cambio de aplicacion o salio al inicio, se reinicia el desbloqueo de emergencia
+        if (pkgName != bypassedPackage) {
+            bypassedPackage = null
+        }
+
         currentForegroundPackage = pkgName
         evaluateOverlayState(pkgName)
     }
 
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        val keyCode = event.keyCode
+        val isVolumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+
+        // Si la pantalla negra NO esta activa, dejar que los botones de volumen funcionen normal
+        if (!isOverlayShown || !isVolumeKey) {
+            return false
+        }
+
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            val now = System.currentTimeMillis()
+            // Si pasan mas de 3 segundos entre pulsaciones, reiniciar la secuencia
+            if (now - lastKeyEventTime > 3000L) {
+                currentKeyInputs.clear()
+            }
+            lastKeyEventTime = now
+
+            currentKeyInputs.add(keyCode)
+            if (currentKeyInputs.size > secretCombo.size) {
+                currentKeyInputs.removeAt(0)
+            }
+
+            if (currentKeyInputs == secretCombo) {
+                currentKeyInputs.clear()
+                bypassedPackage = currentForegroundPackage
+                hideBlackScreen()
+                Toast.makeText(
+                    this,
+                    "Emergencia: App desbloqueada hasta que salgas de ella",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+
+        // Consumir el evento mientras la pantalla negra esta puesta para no alterar el volumen
+        return true
+    }
+
     private fun evaluateOverlayState(pkgName: String) {
         if (pkgName.isEmpty()) return
+
+        // Si esta app fue desbloqueada con los botones de volumen en esta sesion, no bloquear
+        if (pkgName == bypassedPackage) {
+            hideBlackScreen()
+            return
+        }
 
         val prefs = getSharedPreferences("blocker_prefs", Context.MODE_PRIVATE)
         val isEnabled = prefs.getBoolean("enabled", true)
@@ -86,7 +150,9 @@ class BlackScreenService : AccessibilityService() {
 
     private fun isIgnoredSystemPackage(pkg: String): Boolean {
         return pkg == packageName ||
+                pkg == "android" ||
                 pkg == "com.android.systemui" ||
+                pkg.contains("permissioncontroller") ||
                 pkg.contains("inputmethod") ||
                 pkg.contains("honeyboard") ||
                 pkg.contains("keyboard")
@@ -117,6 +183,7 @@ class BlackScreenService : AccessibilityService() {
             windowManager?.addView(overlay, params)
             blackOverlay = overlay
             isOverlayShown = true
+            currentKeyInputs.clear()
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -131,6 +198,7 @@ class BlackScreenService : AccessibilityService() {
         } finally {
             blackOverlay = null
             isOverlayShown = false
+            currentKeyInputs.clear()
         }
     }
 
