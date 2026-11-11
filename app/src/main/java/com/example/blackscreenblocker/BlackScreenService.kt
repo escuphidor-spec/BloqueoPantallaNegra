@@ -2,8 +2,11 @@ package com.example.blackscreenblocker
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -25,12 +28,12 @@ class BlackScreenService : AccessibilityService() {
     // Guarda la app desbloqueada por emergencia hasta que el usuario salga de ella
     private var bypassedPackage: String? = null
 
-    // Combinacion secreta: Subir, Subir, Bajar, Bajar
+    // Nueva combinacion secreta: Abajo, Abajo, Arriba, Arriba
     private val secretCombo = listOf(
-        KeyEvent.KEYCODE_VOLUME_UP,
-        KeyEvent.KEYCODE_VOLUME_UP,
         KeyEvent.KEYCODE_VOLUME_DOWN,
-        KeyEvent.KEYCODE_VOLUME_DOWN
+        KeyEvent.KEYCODE_VOLUME_DOWN,
+        KeyEvent.KEYCODE_VOLUME_UP,
+        KeyEvent.KEYCODE_VOLUME_UP
     )
     private val currentKeyInputs = mutableListOf<Int>()
     private var lastKeyEventTime = 0L
@@ -39,8 +42,8 @@ class BlackScreenService : AccessibilityService() {
 
     private val scheduleCheckRunnable = object : Runnable {
         override fun run() {
-            evaluateOverlayState(currentForegroundPackage)
-            handler.postDelayed(this, 10_000L)
+            verifyActiveWindowAndEvaluate()
+            handler.postDelayed(this, 5_000L)
         }
     }
 
@@ -54,9 +57,37 @@ class BlackScreenService : AccessibilityService() {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         val pkgName = event.packageName?.toString() ?: return
 
+        // Si la pantalla negra esta activa y el usuario intenta bajar la barra de estado, cerrarla al instante
+        if (pkgName == "com.android.systemui") {
+            if (isOverlayShown) {
+                collapseStatusBar()
+            }
+            return
+        }
+
+        // Ignorar paneles del sistema, teclados y subprocesos de la barra de notificaciones
         if (isIgnoredSystemPackage(pkgName)) return
 
-        // Si el usuario cambio de aplicacion o salio al inicio, se reinicia el desbloqueo de emergencia
+        // Si el usuario sale al Launcher (Inicio / Recientes), desbloquear de inmediato
+        if (isLauncherPackage(pkgName)) {
+            bypassedPackage = null
+            currentForegroundPackage = pkgName
+            hideBlackScreen()
+            return
+        }
+
+        // Ignorar paquetes que no sean aplicaciones instaladas abribles
+        if (!isLaunchableApp(pkgName)) return
+
+        // Si la pantalla negra ya esta activa y entra un evento de otra app que no es el Launcher,
+        // verificar con rootInActiveWindow que no sea un widget dentro de la barra de estado
+        if (isOverlayShown && pkgName != currentForegroundPackage) {
+            handler.postDelayed({
+                verifyActiveWindowAndEvaluate()
+            }, 200L)
+            return
+        }
+
         if (pkgName != bypassedPackage) {
             bypassedPackage = null
         }
@@ -65,18 +96,30 @@ class BlackScreenService : AccessibilityService() {
         evaluateOverlayState(pkgName)
     }
 
+    private fun verifyActiveWindowAndEvaluate() {
+        val activePkg = rootInActiveWindow?.packageName?.toString()
+        if (!activePkg.isNullOrEmpty() && activePkg != "com.android.systemui" && !isIgnoredSystemPackage(activePkg)) {
+            if (isLauncherPackage(activePkg) || isLaunchableApp(activePkg)) {
+                if (activePkg != bypassedPackage) {
+                    bypassedPackage = null
+                }
+                currentForegroundPackage = activePkg
+            }
+        }
+        evaluateOverlayState(currentForegroundPackage)
+    }
+
     override fun onKeyEvent(event: KeyEvent): Boolean {
         val keyCode = event.keyCode
         val isVolumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
 
-        // Si la pantalla negra NO esta activa, dejar que los botones de volumen funcionen normal
+        // Si la pantalla negra NO esta activa, los botones de volumen funcionan normal
         if (!isOverlayShown || !isVolumeKey) {
             return false
         }
 
-        if (event.action == KeyEvent.ACTION_DOWN) {
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             val now = System.currentTimeMillis()
-            // Si pasan mas de 3 segundos entre pulsaciones, reiniciar la secuencia
             if (now - lastKeyEventTime > 3000L) {
                 currentKeyInputs.clear()
             }
@@ -99,14 +142,12 @@ class BlackScreenService : AccessibilityService() {
             }
         }
 
-        // Consumir el evento mientras la pantalla negra esta puesta para no alterar el volumen
         return true
     }
 
     private fun evaluateOverlayState(pkgName: String) {
         if (pkgName.isEmpty()) return
 
-        // Si esta app fue desbloqueada con los botones de volumen en esta sesion, no bloquear
         if (pkgName == bypassedPackage) {
             hideBlackScreen()
             return
@@ -148,14 +189,47 @@ class BlackScreenService : AccessibilityService() {
         }
     }
 
+    private fun collapseStatusBar() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                performGlobalAction(GLOBAL_ACTION_DISMISS_NOTIFICATION_SHADE)
+            } else {
+                @Suppress("DEPRECATION")
+                sendBroadcast(Intent(Intent.ACTION_CLOSE_SYSTEM_DIALOGS))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun isLauncherPackage(pkg: String): Boolean {
+        val p = pkg.lowercase()
+        return p.contains("launcher") || p.contains("home") || p == "com.sec.android.app.launcher"
+    }
+
+    private fun isLaunchableApp(pkg: String): Boolean {
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            setPackage(pkg)
+        }
+        val list = packageManager.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
+        return list.isNotEmpty()
+    }
+
     private fun isIgnoredSystemPackage(pkg: String): Boolean {
+        val p = pkg.lowercase()
         return pkg == packageName ||
                 pkg == "android" ||
                 pkg == "com.android.systemui" ||
-                pkg.contains("permissioncontroller") ||
-                pkg.contains("inputmethod") ||
-                pkg.contains("honeyboard") ||
-                pkg.contains("keyboard")
+                p.contains("systemui") ||
+                p.contains("quickboard") ||       // Panel de medios/dispositivos en barra de estado Samsung
+                p.contains("cocktailbar") ||      // Panel Edge de Samsung
+                p.contains("oneconnect") ||       // Control de dispositivos en barra de notificaciones
+                p.contains("permissioncontroller") ||
+                p.contains("inputmethod") ||
+                p.contains("honeyboard") ||
+                p.contains("keyboard") ||
+                p.contains("biometrics")
     }
 
     private fun showBlackScreen() {
@@ -163,7 +237,10 @@ class BlackScreenService : AccessibilityService() {
 
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
-            setOnTouchListener { _, _ -> true }
+            setOnTouchListener { _, _ ->
+                collapseStatusBar()
+                true
+            }
             isClickable = true
             isFocusable = false
         }
@@ -173,10 +250,16 @@ class BlackScreenService : AccessibilityService() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_FULLSCREEN,
             PixelFormat.OPAQUE
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            // Extiende la pantalla negra hasta la franja superior de la camara/barra de estado
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
 
         try {
@@ -184,6 +267,7 @@ class BlackScreenService : AccessibilityService() {
             blackOverlay = overlay
             isOverlayShown = true
             currentKeyInputs.clear()
+            collapseStatusBar()
         } catch (e: Exception) {
             e.printStackTrace()
         }
